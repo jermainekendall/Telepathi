@@ -1,0 +1,82 @@
+#version 450
+
+// Each workgroup processes one 4KB block and estimates its entropy
+// by counting byte value frequencies. Blocks with low entropy are
+// worth compressing; high-entropy blocks should be sent raw.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Input: raw block data as uint32 array
+layout(std430, binding = 0) readonly buffer InputBlocks {
+    uint data[];
+} inputBlocks;
+
+// Output: one float per block = estimated entropy (0.0 = uniform, 8.0 = random)
+// Plus a uint flag: 1 = compressible, 0 = incompressible
+layout(std430, binding = 1) writeonly buffer OutputEntropy {
+    uint flags[]; // 0 = incompressible (skip compression), 1 = try compression
+} outputEntropy;
+
+layout(push_constant) uniform PushConstants {
+    uint numBlocks;
+    uint lastBlockSize;
+    float entropyThreshold; // Blocks above this entropy are incompressible (e.g., 7.5)
+} pc;
+
+// Shared memory for byte frequency histogram (256 bins)
+shared uint histogram[256];
+
+void main() {
+    uint blockIdx = gl_WorkGroupID.x;
+    if (blockIdx >= pc.numBlocks) return;
+
+    uint localId = gl_LocalInvocationID.x;
+
+    // Determine block size
+    uint blockSize = 4096u;
+    if (blockIdx == pc.numBlocks - 1u && pc.lastBlockSize > 0u) {
+        blockSize = pc.lastBlockSize;
+    }
+
+    uint baseOffset = blockIdx * 1024u; // 1024 uint32s per 4KB block
+    uint numWords = (blockSize + 3u) / 4u;
+
+    // Initialize histogram
+    histogram[localId] = 0u;
+    barrier();
+
+    // Each thread counts bytes from its portion of the block
+    // 256 threads, ~1024 uint32s = ~4 words per thread
+    uint wordsPerThread = (numWords + 255u) / 256u;
+    uint startWord = localId * wordsPerThread;
+    uint endWord = min(startWord + wordsPerThread, numWords);
+
+    for (uint w = startWord; w < endWord; w++) {
+        uint val = inputBlocks.data[baseOffset + w];
+        uint bytePos = w * 4u;
+
+        // Extract and count each byte
+        if (bytePos < blockSize) atomicAdd(histogram[(val) & 0xFFu], 1u);
+        if (bytePos + 1u < blockSize) atomicAdd(histogram[(val >> 8u) & 0xFFu], 1u);
+        if (bytePos + 2u < blockSize) atomicAdd(histogram[(val >> 16u) & 0xFFu], 1u);
+        if (bytePos + 3u < blockSize) atomicAdd(histogram[(val >> 24u) & 0xFFu], 1u);
+    }
+    barrier();
+
+    // Thread 0 computes entropy from histogram
+    if (localId == 0u) {
+        float entropy = 0.0;
+        float fBlockSize = float(blockSize);
+
+        for (int i = 0; i < 256; i++) {
+            if (histogram[i] > 0u) {
+                float p = float(histogram[i]) / fBlockSize;
+                // log2(p) = log(p) / log(2)
+                entropy -= p * (log(p) / log(2.0));
+            }
+        }
+
+        // Classify: if entropy is below threshold, block is compressible
+        outputEntropy.flags[blockIdx] = (entropy < pc.entropyThreshold) ? 1u : 0u;
+    }
+}
