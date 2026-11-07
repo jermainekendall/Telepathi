@@ -42,6 +42,11 @@ chmod +x install.sh
 ./install.sh
 ```
 
+> **Upgrading from v1.0.0:** install the new build on both machines. A v1.1.0
+> receiver still accepts files from a v1.0.0 sender, but a v1.0.0 receiver will
+> report a failed integrity check for files from a v1.1.0 sender, because the
+> checksum now arrives at the end of the transfer.
+
 ### 3. Test It
 
 **On Machine A (Receiver):**
@@ -58,7 +63,7 @@ telepathi send -host <MACHINE_A_IP> -port 7331 /path/to/file
 ### 4. Tune Parallelism
 
 ```bash
-# Use 8 workers for hashing (defaults to CPU count)
+# Use 8 workers for hashing and compression (defaults to CPU count)
 telepathi send -host <IP> -workers 8 myfile.dat
 ```
 

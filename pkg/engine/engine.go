@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -62,9 +64,92 @@ type processedBlock struct {
 	compressed []byte // compressed version (nil if not worth it)
 }
 
+// EntropyThreshold is the Shannon entropy (bits per byte) above which a block
+// is treated as incompressible and sent raw without trying deflate.
+// A uniformly random 4KB block measures about 7.95; 7.9 skips those while
+// still trying blocks that contain repeated runs.
+const EntropyThreshold = 7.9
+
+// flate.NewWriter allocates over 1 MB of state, so writers and readers are
+// pooled and reset rather than created per block.
+var flateWriterPool = sync.Pool{
+	New: func() any {
+		w, _ := flate.NewWriter(io.Discard, flate.BestSpeed)
+		return w
+	},
+}
+
+var flateReaderPool = sync.Pool{
+	New: func() any {
+		return flate.NewReader(bytes.NewReader(nil))
+	},
+}
+
+// highEntropy reports whether a block looks incompressible, using a byte
+// histogram (a few microseconds per block, far cheaper than running deflate).
+func highEntropy(block []byte) bool {
+	if len(block) == 0 {
+		return false
+	}
+	var hist [256]uint32
+	for _, b := range block {
+		hist[b]++
+	}
+	n := float64(len(block))
+	var sum float64
+	for _, c := range hist {
+		if c > 0 {
+			fc := float64(c)
+			sum += fc * math.Log2(fc)
+		}
+	}
+	return math.Log2(n)-sum/n > EntropyThreshold
+}
+
+// compressBlock deflates a block with a pooled writer. It returns nil when the
+// result would not save at least 10%.
+func compressBlock(block []byte) []byte {
+	var buf bytes.Buffer
+	buf.Grow(len(block))
+	w := flateWriterPool.Get().(*flate.Writer)
+	w.Reset(&buf)
+	w.Write(block)
+	w.Close()
+	flateWriterPool.Put(w)
+	if buf.Len() < len(block)*9/10 {
+		return buf.Bytes()
+	}
+	return nil
+}
+
+// errBlockTooLarge is returned when a compressed block inflates past BlockSize.
+var errBlockTooLarge = errors.New("decompressed block exceeds block size")
+
+// decompressBlock inflates one block with a pooled reader, refusing output
+// larger than one block.
+func decompressBlock(payload []byte) ([]byte, error) {
+	r := flateReaderPool.Get().(io.ReadCloser)
+	defer flateReaderPool.Put(r)
+	if err := r.(flate.Resetter).Reset(bytes.NewReader(payload), nil); err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	out.Grow(predictor.BlockSize)
+	if _, err := out.ReadFrom(io.LimitReader(r, predictor.BlockSize+1)); err != nil {
+		return nil, err
+	}
+	if out.Len() > predictor.BlockSize {
+		return nil, errBlockTooLarge
+	}
+	return out.Bytes(), nil
+}
+
 // EncodeChunk processes a data chunk into encoded block results.
 // If GPU is available: GPU hashes + classifies, CPU compresses selectively.
 // If CPU only: parallel hash + compress across workers.
+//
+// Raw block payloads in the returned results point into data, so data must
+// not be modified until the results have been marshaled.
 func (pe *ParallelEncoder) EncodeChunk(data []byte) []BlockResult {
 	blockSize := predictor.BlockSize
 	nBlocks := (len(data) + blockSize - 1) / blockSize
@@ -105,16 +190,11 @@ func (pe *ParallelEncoder) encodeChunkGPU(paddedData, origData []byte, nBlocks, 
 	}
 
 	// CPU: compress only the blocks the GPU flagged as compressible
-	type compResult struct {
-		idx        int
-		compressed []byte
-	}
+	// that the receiver does not already have
+	compressed := make([][]byte, nBlocks)
 	compChan := make(chan int, nBlocks)
-	compResults := make([]compResult, 0)
-	var compMu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Queue compressible blocks for CPU compression
 	for i := 0; i < nBlocks; i++ {
 		if compressible[i] && !pe.Pred.Known(hashes[i]) {
 			compChan <- i
@@ -132,28 +212,12 @@ func (pe *ParallelEncoder) encodeChunkGPU(paddedData, origData []byte, nBlocks, 
 				if end > len(origData) {
 					end = len(origData)
 				}
-				block := origData[start:end]
-
-				var buf bytes.Buffer
-				w, _ := flate.NewWriter(&buf, flate.BestSpeed)
-				w.Write(block)
-				w.Close()
-
-				if buf.Len() < len(block)*9/10 {
-					compMu.Lock()
-					compResults = append(compResults, compResult{idx, buf.Bytes()})
-					compMu.Unlock()
-				}
+				// Each index is written by exactly one worker
+				compressed[idx] = compressBlock(origData[start:end])
 			}
 		}()
 	}
 	wg.Wait()
-
-	// Build lookup of compression results
-	compMap := make(map[int][]byte)
-	for _, cr := range compResults {
-		compMap[cr.idx] = cr.compressed
-	}
 
 	// Phase 2: Sequential classification
 	for i := 0; i < nBlocks; i++ {
@@ -176,7 +240,7 @@ func (pe *ParallelEncoder) encodeChunkGPU(paddedData, origData []byte, nBlocks, 
 			atomic.AddUint64(&pe.HashHits, 1)
 			atomic.AddUint64(&pe.BytesOut, uint64(predictor.HashSize))
 			pe.Pred.Observe(hash, block)
-		} else if comp, ok := compMap[i]; ok {
+		} else if comp := compressed[i]; comp != nil {
 			results[i] = BlockResult{
 				Index: i, Type: BlockTypeCompressed,
 				Hash: hash, Payload: comp, RawSize: len(block),
@@ -185,11 +249,10 @@ func (pe *ParallelEncoder) encodeChunkGPU(paddedData, origData []byte, nBlocks, 
 			atomic.AddUint64(&pe.BytesOut, uint64(len(comp)))
 			pe.Pred.Observe(hash, block)
 		} else {
-			blockCopy := make([]byte, len(block))
-			copy(blockCopy, block)
+			// Payload aliases origData; Observe stores its own copy
 			results[i] = BlockResult{
 				Index: i, Type: BlockTypeRaw,
-				Hash: hash, Payload: blockCopy, RawSize: len(block),
+				Hash: hash, Payload: block, RawSize: len(block),
 			}
 			atomic.AddUint64(&pe.RawBlocks, 1)
 			atomic.AddUint64(&pe.BytesOut, uint64(len(block)))
@@ -200,7 +263,7 @@ func (pe *ParallelEncoder) encodeChunkGPU(paddedData, origData []byte, nBlocks, 
 	return results
 }
 
-// encodeChunkCPU is the original CPU-only path
+// encodeChunkCPU is the CPU-only path
 func (pe *ParallelEncoder) encodeChunkCPU(data []byte, nBlocks int) []BlockResult {
 	blockSize := predictor.BlockSize
 	processed := make([]processedBlock, nBlocks)
@@ -225,27 +288,20 @@ func (pe *ParallelEncoder) encodeChunkCPU(data []byte, nBlocks int) []BlockResul
 					end = len(data)
 				}
 				block := data[start:end]
+				h := predictor.HashBlock(block)
 
-				// Make a copy since data buffer may be reused
-				blockCopy := make([]byte, len(block))
-				copy(blockCopy, block)
-
-				h := predictor.HashBlock(blockCopy)
-
-				// Pre-compress the block using deflate (fast level)
+				// Only compress blocks the receiver doesn't already have and
+				// that aren't random-looking. Observe() copies blocks into the
+				// cache, so no copy is needed here.
 				var comp []byte
-				var buf bytes.Buffer
-				w, _ := flate.NewWriter(&buf, flate.BestSpeed)
-				w.Write(blockCopy)
-				w.Close()
-				if buf.Len() < len(blockCopy)*9/10 { // Only use if >=10% savings
-					comp = buf.Bytes()
+				if !pe.Pred.Known(h) && !highEntropy(block) {
+					comp = compressBlock(block)
 				}
 
 				processed[idx] = processedBlock{
 					idx:        idx,
 					hash:       h,
-					data:       blockCopy,
+					data:       block,
 					compressed: comp,
 				}
 			}
@@ -303,13 +359,25 @@ func (pe *ParallelEncoder) encodeChunkCPU(data []byte, nBlocks int) []BlockResul
 
 // MarshalResults serializes encoded blocks for the wire
 func MarshalResults(results []BlockResult) []byte {
-	// Estimate size
-	size := 4
+	return appendResults(nil, results)
+}
+
+// MarshalChunk serializes a data chunk frame: the original chunk size
+// (4 bytes) followed by the encoded blocks, in a single allocation.
+func MarshalChunk(origSize uint32, results []BlockResult) []byte {
+	var prefix [4]byte
+	binary.BigEndian.PutUint32(prefix[:], origSize)
+	return appendResults(prefix[:], results)
+}
+
+func appendResults(prefix []byte, results []BlockResult) []byte {
+	size := len(prefix) + 4
 	for _, r := range results {
 		size += 1 + predictor.HashSize + 4 + len(r.Payload)
 	}
 
 	buf := make([]byte, 0, size)
+	buf = append(buf, prefix...)
 	tmp := make([]byte, 4)
 
 	binary.BigEndian.PutUint32(tmp, uint32(len(results)))
@@ -328,7 +396,8 @@ func MarshalResults(results []BlockResult) []byte {
 	return buf
 }
 
-// UnmarshalResults deserializes from wire format
+// UnmarshalResults deserializes from wire format.
+// Payloads alias data, so data must not be modified while results are in use.
 func UnmarshalResults(data []byte) ([]BlockResult, error) {
 	if len(data) < 4 {
 		return nil, nil
@@ -363,8 +432,7 @@ func UnmarshalResults(data []byte) ([]BlockResult, error) {
 			if pos+payloadLen > len(data) {
 				break
 			}
-			r.Payload = make([]byte, payloadLen)
-			copy(r.Payload, data[pos:pos+payloadLen])
+			r.Payload = data[pos : pos+payloadLen]
 			pos += payloadLen
 		}
 
@@ -393,9 +461,7 @@ func DecodeBlocks(results []BlockResult, pred *predictor.BlockPredictor, blockSi
 
 		case BlockTypeCompressed:
 			// Decompress
-			reader := flate.NewReader(bytes.NewReader(r.Payload))
-			decompressed, err := io.ReadAll(reader)
-			reader.Close()
+			decompressed, err := decompressBlock(r.Payload)
 			if err != nil {
 				// Decompression failed — use payload as-is
 				out = append(out, r.Payload...)

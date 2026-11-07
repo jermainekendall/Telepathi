@@ -24,9 +24,29 @@ const (
 	// ChunkSize is how many blocks we process at once before sending
 	// 256 blocks * 4KB = 1MB per network message
 	BlocksPerChunk = 256
-	Version        = "1.0.0"
+	Version        = "1.1.0"
 	DefaultPort    = "7331"
+
+	// PipelineDepth is how many chunks may be in flight between the
+	// read, encode and send stages (and recv, decode and write stages).
+	PipelineDepth = 4
 )
+
+// fileEnd is the MsgFileEnd payload. The sender hashes the file while
+// streaming it, so the checksum is only known once the last chunk is sent.
+type fileEnd struct {
+	Checksum string `json:"checksum"`
+}
+
+// safeFileName reduces a peer-supplied name to a single path element so a
+// received file can never be written outside the save directory.
+func safeFileName(name string) (string, error) {
+	base := filepath.Base(filepath.Clean("/" + name))
+	if base == "/" || base == "." || base == ".." || base == "" {
+		return "", fmt.Errorf("invalid file name %q", name)
+	}
+	return base, nil
+}
 
 type Stats struct {
 	RawBytes         uint64  `json:"raw_bytes"`
@@ -168,7 +188,16 @@ func handleReceive(conn *transport.Conn, dir string) {
 	json.Unmarshal(metaData, &fileMeta)
 	fmt.Printf("\nReceiving: %s (%s)\n", fileMeta.Name, humanBytes(uint64(fileMeta.Size)))
 
-	outPath := filepath.Join(dir, fileMeta.Name)
+	safeName, err := safeFileName(fileMeta.Name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Rejected file: %v\n", err)
+		return
+	}
+	if safeName != fileMeta.Name {
+		fmt.Printf("Saving as: %s\n", safeName)
+	}
+
+	outPath := filepath.Join(dir, safeName)
 	outFile, err := os.Create(outPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot create file: %v\n", err)
@@ -183,22 +212,52 @@ func handleReceive(conn *transport.Conn, dir string) {
 	startTime := time.Now()
 	chunks := 0
 
-	// Step 5: Receive and decode chunks
-	for {
-		msgType, chunkData, err := conn.RecvMessage()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nReceive error: %v\n", err)
-			return
+	// Step 5: Receive, decode and write in three overlapping stages.
+	// Decoding stays on this goroutine because the predictor must see
+	// blocks in exactly the order the sender produced them.
+	recvCh := make(chan []byte, PipelineDepth)
+	var recvErr error
+	var endChecksum string
+	go func() {
+		defer close(recvCh)
+		for {
+			msgType, chunkData, err := conn.RecvMessage()
+			if err != nil {
+				recvErr = err
+				return
+			}
+			if msgType == transport.MsgFileEnd {
+				var fe fileEnd
+				if len(chunkData) > 0 {
+					json.Unmarshal(chunkData, &fe)
+				}
+				endChecksum = fe.Checksum
+				return
+			}
+			if msgType == transport.MsgData {
+				recvCh <- chunkData
+			}
 		}
+	}()
 
-		if msgType == transport.MsgFileEnd {
-			break
+	writeCh := make(chan []byte, PipelineDepth)
+	writeDone := make(chan error, 1)
+	go func() {
+		var werr error
+		for decoded := range writeCh {
+			if werr != nil {
+				continue // keep draining so the decoder never blocks
+			}
+			if _, err := outFile.Write(decoded); err != nil {
+				werr = err
+				continue
+			}
+			hasher.Write(decoded)
 		}
+		writeDone <- werr
+	}()
 
-		if msgType != transport.MsgData {
-			continue
-		}
-
+	for chunkData := range recvCh {
 		wireBytes += uint64(len(chunkData))
 
 		// First 4 bytes: original chunk size
@@ -235,15 +294,13 @@ func handleReceive(conn *transport.Conn, dir string) {
 			decoded = decoded[:origSize]
 		}
 		totalRaw += uint64(len(decoded))
-
-		outFile.Write(decoded)
-		hasher.Write(decoded)
+		writeCh <- decoded
 
 		chunks++
 		if chunks%10 == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			if elapsed > 0 {
-				pct := float64(totalRaw) / float64(fileMeta.Size) * 100
+				pct := float64(totalRaw) / float64(max64(uint64(fileMeta.Size), 1)) * 100
 				hitRate := float64(hashBlocks+compressedBlocks) / float64(max64(totalBlocks, 1)) * 100
 				mbps := float64(totalRaw) / 1024 / 1024 / elapsed
 				fmt.Printf("\r  Progress: %.1f%% | Dedup+Compress: %.1f%% | %.1f MB/s     ",
@@ -251,13 +308,30 @@ func handleReceive(conn *transport.Conn, dir string) {
 			}
 		}
 	}
+	close(writeCh)
+	writeErr := <-writeDone
+
+	if recvErr != nil {
+		fmt.Fprintf(os.Stderr, "\nReceive error: %v\n", recvErr)
+		return
+	}
+	if writeErr != nil {
+		fmt.Fprintf(os.Stderr, "\nWrite error: %v\n", writeErr)
+		return
+	}
+
+	// Senders before v1.1.0 put the checksum in the file metadata
+	expectedChecksum := endChecksum
+	if expectedChecksum == "" {
+		expectedChecksum = fileMeta.Checksum
+	}
 
 	elapsed := time.Since(startTime)
 	outFile.Close()
 
 	// Verify checksum
 	gotChecksum := hex.EncodeToString(hasher.Sum(nil))
-	checksumOK := gotChecksum == fileMeta.Checksum
+	checksumOK := expectedChecksum != "" && gotChecksum == expectedChecksum
 
 	savings := (1 - float64(wireBytes)/float64(max64(totalRaw, 1))) * 100
 
@@ -274,7 +348,7 @@ func handleReceive(conn *transport.Conn, dir string) {
 		Savings:          savings,
 	}
 
-	fmt.Println("\n")
+	fmt.Print("\n\n")
 	printStats(stats, checksumOK)
 
 	statsJSON, _ := json.Marshal(stats)
@@ -316,14 +390,6 @@ func cmdSend(args []string) {
 	fmt.Printf("Telepathi Protocol v%s\n", Version)
 	fmt.Printf("File: %s (%s)\n", fileName, humanBytes(uint64(fileSize)))
 	fmt.Printf("Workers: %d\n", *workers)
-
-	// Compute checksum
-	fmt.Print("Computing checksum... ")
-	hasher := sha256.New()
-	io.Copy(hasher, file)
-	checksum := hex.EncodeToString(hasher.Sum(nil))
-	file.Seek(0, 0)
-	fmt.Printf("%s...\n", checksum[:16])
 
 	// Connect
 	addr := *host + ":" + *port
@@ -371,55 +437,90 @@ func cmdSend(args []string) {
 		os.Exit(1)
 	}
 
-	// File metadata
+	// File metadata (checksum follows in MsgFileEnd, computed while streaming)
 	meta, _ := json.Marshal(struct {
-		Name     string `json:"name"`
-		Size     int64  `json:"size"`
-		Checksum string `json:"checksum"`
-	}{fileName, fileSize, checksum})
+		Name string `json:"name"`
+		Size int64  `json:"size"`
+	}{fileName, fileSize})
 	conn.SendMessage(transport.MsgFileStart, meta)
 
 	fmt.Printf("\nSending...\n")
 
-	// Send data in large chunks, processed in parallel
+	// Read, encode and send in three overlapping stages. Encoding stays on
+	// this goroutine because the predictor must see blocks in file order.
 	chunkSize := BlocksPerChunk * predictor.BlockSize // 1MB
-	buf := make([]byte, chunkSize)
 	var totalRaw uint64
 	var wireBytes uint64
 	chunks := 0
 	startTime := time.Now()
 
-	for {
-		n, readErr := io.ReadFull(file, buf)
-		if n == 0 {
-			break
+	hasher := sha256.New()
+	freeBufs := make(chan []byte, PipelineDepth+1)
+	for i := 0; i < PipelineDepth+1; i++ {
+		freeBufs <- make([]byte, chunkSize)
+	}
+	stop := make(chan struct{})
+
+	readCh := make(chan []byte, PipelineDepth)
+	var readErr error
+	go func() {
+		defer close(readCh)
+		for {
+			var buf []byte
+			select {
+			case buf = <-freeBufs:
+			case <-stop:
+				return
+			}
+			n, err := io.ReadFull(file, buf)
+			if n > 0 {
+				hasher.Write(buf[:n])
+				select {
+				case readCh <- buf[:n]:
+				case <-stop:
+					return
+				}
+			}
+			if err != nil {
+				if err != io.EOF && err != io.ErrUnexpectedEOF {
+					readErr = err
+				}
+				return
+			}
 		}
+	}()
 
-		chunk := buf[:n]
-		totalRaw += uint64(n)
+	sendCh := make(chan []byte, PipelineDepth)
+	sendDone := make(chan error, 1)
+	go func() {
+		var serr error
+		for frame := range sendCh {
+			if serr != nil {
+				continue // drain so the encoder never blocks
+			}
+			if err := conn.SendMessage(transport.MsgData, frame); err != nil {
+				serr = err
+				close(stop)
+			}
+		}
+		sendDone <- serr
+	}()
 
-		// Encode blocks in parallel
+	for chunk := range readCh {
+		totalRaw += uint64(len(chunk))
+
 		results := enc.EncodeChunk(chunk)
-
-		// Serialize and send
-		encoded := engine.MarshalResults(results)
-
-		// Frame: original size (4) + encoded blocks
-		frame := make([]byte, 4+len(encoded))
-		binary.BigEndian.PutUint32(frame[:4], uint32(n))
-		copy(frame[4:], encoded)
+		frame := engine.MarshalChunk(uint32(len(chunk)), results)
+		freeBufs <- chunk[:cap(chunk)] // results alias chunk; safe once marshaled
 
 		wireBytes += uint64(len(frame))
-		if err := conn.SendMessage(transport.MsgData, frame); err != nil {
-			fmt.Fprintf(os.Stderr, "\nSend error: %v\n", err)
-			return
-		}
+		sendCh <- frame
 
 		chunks++
 		if chunks%5 == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			if elapsed > 0 {
-				pct := float64(totalRaw) / float64(fileSize) * 100
+				pct := float64(totalRaw) / float64(max64(uint64(fileSize), 1)) * 100
 				hitRate := float64(enc.HashHits+enc.CompressBlocks) /
 					float64(max64(enc.TotalBlocks, 1)) * 100
 				mbps := float64(totalRaw) / 1024 / 1024 / elapsed
@@ -427,14 +528,24 @@ func cmdSend(args []string) {
 					pct, hitRate, mbps)
 			}
 		}
-
-		if readErr != nil {
-			break
-		}
+	}
+	close(sendCh)
+	if err := <-sendDone; err != nil {
+		fmt.Fprintf(os.Stderr, "\nSend error: %v\n", err)
+		return
+	}
+	if readErr != nil {
+		fmt.Fprintf(os.Stderr, "\nRead error: %v\n", readErr)
+		return
 	}
 
 	elapsed := time.Since(startTime)
-	conn.SendMessage(transport.MsgFileEnd, nil)
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+	endData, _ := json.Marshal(fileEnd{Checksum: checksum})
+	if err := conn.SendMessage(transport.MsgFileEnd, endData); err != nil {
+		fmt.Fprintf(os.Stderr, "\nSend error: %v\n", err)
+		return
+	}
 
 	// Wait for receiver stats
 	msgType, _, err = conn.RecvMessage()
@@ -457,7 +568,7 @@ func cmdSend(args []string) {
 		Savings:          savings,
 	}
 
-	fmt.Println("\n")
+	fmt.Print("\n\n")
 	printStats(stats, true)
 }
 
